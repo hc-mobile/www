@@ -18,8 +18,13 @@
         // relative document */
         
     }
-    function sigPage(){
-      var ref=window.open("index.html","_self");
+    function sigPage(i){
+        var page;
+//        switch(i){
+//            case 1: page= "index.html";break;
+//            case 2: page= "jquery.mobile-1.2.1/demos/index.html";break;
+//        }
+        var ref=window.open("jquery.mobile-1.2.1/demos/index.html","_self");
     }
 
     </script>
@@ -34,6 +39,8 @@
     </style>
   </head>
   <body>
-    <div onclick="sigPage();return false;">Ir a Siguiente Pagina</div>
+    <div onclick="sigPage(1);return false;">Ir a Siguiente Pagina</div>
+    <div onclick="sigPage(2);return false;">jquerymobile</div>
+
   </body>
 </html>
