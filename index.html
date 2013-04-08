@@ -47,7 +47,8 @@
         case 1:l="compass.html";break;
         case 2:l="camera.html";break;
         case 3:l="jqm.html";break;
-        case 4:l="sencha/index.html";break;
+        case 4:l="sencha/index.html";
+        case 100:l="raul.html";break;
       }
       var ref=window.open(l,"_self");
     }
@@ -55,6 +56,7 @@
     </script>
   </head>
   <body>
+    <p><a href="#" onclick="ir(100); return false;" style="color:green;">raul's</a></p>
     <p><a href="#" onclick="showAlert(); return false;">Show Alert</a></p>
     <p><a href="#" onclick="playBeep(); return false;">Play Beep</a></p>
     <p><a href="#" onclick="vibrate(); return false;">Vibrate</a></p>
@@ -63,5 +65,6 @@
     <p><a href="#" onclick="ir(2); return false;" style="color:green;">Camara</a></p>
     <p><a href="#" onclick="ir(3); return false;" style="color:green;">JQueryMobile</a></p>
     <p><a href="#" onclick="ir(4); return false;" style="color:green;">Sencha</a></p>
+      
   </body>
 </html>
