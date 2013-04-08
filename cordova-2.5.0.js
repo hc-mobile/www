@@ -1,8 +1,8 @@
-// Platform: ios
+// Platform: android
 
 // commit f50d20a87431c79a54572263729461883f611a53
 
-// File generated at :: Tue Feb 26 2013 14:26:19 GMT-0800 (PST)
+// File generated at :: Tue Feb 26 2013 13:37:51 GMT-0800 (PST)
 
 /*
  Licensed to the Apache Software Foundation (ASF) under one
@@ -774,216 +774,238 @@ module.exports = {
 };
 });
 
-// file: lib/ios/exec.js
+// file: lib/android/exec.js
 define("cordova/exec", function(require, exports, module) {
 
 /**
- * Creates a gap bridge iframe used to notify the native code about queued
- * commands.
+ * Execute a cordova command.  It is up to the native side whether this action
+ * is synchronous or asynchronous.  The native side can return:
+ *      Synchronous: PluginResult object as a JSON string
+ *      Asynchronous: Empty string ""
+ * If async, the native side will cordova.callbackSuccess or cordova.callbackError,
+ * depending upon the result of the action.
  *
- * @private
+ * @param {Function} success    The success callback
+ * @param {Function} fail       The fail callback
+ * @param {String} service      The name of the service to use
+ * @param {String} action       Action to be run in cordova
+ * @param {String[]} [args]     Zero or more arguments to pass to the method
  */
 var cordova = require('cordova'),
-    channel = require('cordova/channel'),
+    nativeApiProvider = require('cordova/plugin/android/nativeapiprovider'),
     utils = require('cordova/utils'),
     jsToNativeModes = {
-        IFRAME_NAV: 0,
-        XHR_NO_PAYLOAD: 1,
-        XHR_WITH_PAYLOAD: 2,
-        XHR_OPTIONAL_PAYLOAD: 3
+        PROMPT: 0,
+        JS_OBJECT: 1,
+        // This mode is currently for benchmarking purposes only. It must be enabled
+        // on the native side through the ENABLE_LOCATION_CHANGE_EXEC_MODE
+        // constant within CordovaWebViewClient.java before it will work.
+        LOCATION_CHANGE: 2
     },
-    bridgeMode,
-    execIframe,
-    execXhr,
-    requestCount = 0,
-    vcHeaderValue = null,
-    commandQueue = [], // Contains pending JS->Native messages.
-    isInContextOfEvalJs = 0;
+    nativeToJsModes = {
+        // Polls for messages using the JS->Native bridge.
+        POLLING: 0,
+        // For LOAD_URL to be viable, it would need to have a work-around for
+        // the bug where the soft-keyboard gets dismissed when a message is sent.
+        LOAD_URL: 1,
+        // For the ONLINE_EVENT to be viable, it would need to intercept all event
+        // listeners (both through addEventListener and window.ononline) as well
+        // as set the navigator property itself.
+        ONLINE_EVENT: 2,
+        // Uses reflection to access private APIs of the WebView that can send JS
+        // to be executed.
+        // Requires Android 3.2.4 or above.
+        PRIVATE_API: 3
+    },
+    jsToNativeBridgeMode,  // Set lazily.
+    nativeToJsBridgeMode = nativeToJsModes.ONLINE_EVENT,
+    pollEnabled = false,
+    messagesFromNative = [];
 
-function createExecIframe() {
-    var iframe = document.createElement("iframe");
-    iframe.style.display = 'none';
-    document.body.appendChild(iframe);
-    return iframe;
-}
-
-function shouldBundleCommandJson() {
-    if (bridgeMode == jsToNativeModes.XHR_WITH_PAYLOAD) {
-        return true;
+function androidExec(success, fail, service, action, args) {
+    // Set default bridge modes if they have not already been set.
+    // By default, we use the failsafe, since addJavascriptInterface breaks too often
+    if (jsToNativeBridgeMode === undefined) {
+        androidExec.setJsToNativeBridgeMode(jsToNativeModes.JS_OBJECT);
     }
-    if (bridgeMode == jsToNativeModes.XHR_OPTIONAL_PAYLOAD) {
-        var payloadLength = 0;
-        for (var i = 0; i < commandQueue.length; ++i) {
-            payloadLength += commandQueue[i].length;
+
+    // Process any ArrayBuffers in the args into a string.
+    for (var i = 0; i < args.length; i++) {
+        if (utils.typeName(args[i]) == 'ArrayBuffer') {
+            args[i] = window.btoa(String.fromCharCode.apply(null, new Uint8Array(args[i])));
         }
-        // The value here was determined using the benchmark within CordovaLibApp on an iPad 3.
-        return payloadLength < 4500;
-    }
-    return false;
-}
-
-function massageArgsJsToNative(args) {
-    if (!args || utils.typeName(args) != 'Array') {
-       return args;
-    }
-    var encodeArrayBufferAs8bitString = function(ab) {
-        return String.fromCharCode.apply(null, new Uint8Array(ab));
-    };
-    var encodeArrayBufferAsBase64 = function(ab) {
-        return window.btoa(encodeArrayBufferAs8bitString(ab));
-    };
-    args.forEach(function(arg, i) {
-        if (utils.typeName(arg) == 'ArrayBuffer') {
-            args[i] = {
-                'CDVType': 'ArrayBuffer',
-                'data': encodeArrayBufferAsBase64(arg)
-            };
-        }
-    });
-    return args;
-}
-
-function massagePayloadNativeToJs(payload) {
-    if (payload && payload.hasOwnProperty('CDVType') && payload.CDVType == 'ArrayBuffer') {
-        var stringToArrayBuffer = function(str) {
-            var ret = new Uint8Array(str.length);
-            for (var i = 0; i < str.length; i++) {
-                ret[i] = str.charCodeAt(i);
-            }
-            return ret.buffer;
-        };
-        var base64ToArrayBuffer = function(b64) {
-            return stringToArrayBuffer(atob(b64));
-        };
-        payload = base64ToArrayBuffer(payload.data);
-    }
-    return payload;
-}
-
-function iOSExec() {
-    // XHR mode does not work on iOS 4.2, so default to IFRAME_NAV for such devices.
-    // XHR mode's main advantage is working around a bug in -webkit-scroll, which
-    // doesn't exist in 4.X devices anyways.
-    if (bridgeMode === undefined) {
-        bridgeMode = navigator.userAgent.indexOf(' 4_') == -1 ? jsToNativeModes.XHR_NO_PAYLOAD : jsToNativeModes.IFRAME_NAV;
     }
 
-    var successCallback, failCallback, service, action, actionArgs, splitCommand;
-    var callbackId = null;
-    if (typeof arguments[0] !== "string") {
-        // FORMAT ONE
-        successCallback = arguments[0];
-        failCallback = arguments[1];
-        service = arguments[2];
-        action = arguments[3];
-        actionArgs = arguments[4];
+    var callbackId = service + cordova.callbackId++,
+        argsJson = JSON.stringify(args),
+        returnValue;
 
-        // Since we need to maintain backwards compatibility, we have to pass
-        // an invalid callbackId even if no callback was provided since plugins
-        // will be expecting it. The Cordova.exec() implementation allocates
-        // an invalid callbackId and passes it even if no callbacks were given.
-        callbackId = 'INVALID';
+    // TODO: Returning the payload of a synchronous call was deprecated in 2.2.0.
+    // Remove it after 6 months.
+    function captureReturnValue(value) {
+        returnValue = value;
+        success && success(value);
+    }
+
+    cordova.callbacks[callbackId] = {success:captureReturnValue, fail:fail};
+
+    if (jsToNativeBridgeMode == jsToNativeModes.LOCATION_CHANGE) {
+        window.location = 'http://cdv_exec/' + service + '#' + action + '#' + callbackId + '#' + argsJson;
     } else {
-        // FORMAT TWO
-        splitCommand = arguments[0].split(".");
-        action = splitCommand.pop();
-        service = splitCommand.join(".");
-        actionArgs = Array.prototype.splice.call(arguments, 1);
+        var messages = nativeApiProvider.get().exec(service, action, callbackId, argsJson);
+        androidExec.processMessages(messages);
     }
-
-    // Register the callbacks and add the callbackId to the positional
-    // arguments if given.
-    if (successCallback || failCallback) {
-        callbackId = service + cordova.callbackId++;
-        cordova.callbacks[callbackId] =
-            {success:successCallback, fail:failCallback};
-    }
-
-    actionArgs = massageArgsJsToNative(actionArgs);
-
-    var command = [callbackId, service, action, actionArgs];
-
-    // Stringify and queue the command. We stringify to command now to
-    // effectively clone the command arguments in case they are mutated before
-    // the command is executed.
-    commandQueue.push(JSON.stringify(command));
-
-    // If we're in the context of a stringByEvaluatingJavaScriptFromString call,
-    // then the queue will be flushed when it returns; no need for a poke.
-    // Also, if there is already a command in the queue, then we've already
-    // poked the native side, so there is no reason to do so again.
-    if (!isInContextOfEvalJs && commandQueue.length == 1) {
-        if (bridgeMode != jsToNativeModes.IFRAME_NAV) {
-            // This prevents sending an XHR when there is already one being sent.
-            // This should happen only in rare circumstances (refer to unit tests).
-            if (execXhr && execXhr.readyState != 4) {
-                execXhr = null;
-            }
-            // Re-using the XHR improves exec() performance by about 10%.
-            execXhr = execXhr || new XMLHttpRequest();
-            // Changing this to a GET will make the XHR reach the URIProtocol on 4.2.
-            // For some reason it still doesn't work though...
-            // Add a timestamp to the query param to prevent caching.
-            execXhr.open('HEAD', "/!gap_exec?" + (+new Date()), true);
-            if (!vcHeaderValue) {
-                vcHeaderValue = /.*\((.*)\)/.exec(navigator.userAgent)[1];
-            }
-            execXhr.setRequestHeader('vc', vcHeaderValue);
-            execXhr.setRequestHeader('rc', ++requestCount);
-            if (shouldBundleCommandJson()) {
-                execXhr.setRequestHeader('cmds', iOSExec.nativeFetchMessages());
-            }
-            execXhr.send(null);
+    if (cordova.callbacks[callbackId]) {
+        if (success || fail) {
+            cordova.callbacks[callbackId].success = success;
         } else {
-            execIframe = execIframe || createExecIframe();
-            execIframe.src = "gap://ready";
+            delete cordova.callbacks[callbackId];
         }
+    }
+    return returnValue;
+}
+
+function pollOnce() {
+    var msg = nativeApiProvider.get().retrieveJsMessages();
+    androidExec.processMessages(msg);
+}
+
+function pollingTimerFunc() {
+    if (pollEnabled) {
+        pollOnce();
+        setTimeout(pollingTimerFunc, 50);
     }
 }
 
-iOSExec.jsToNativeModes = jsToNativeModes;
-
-iOSExec.setJsToNativeBridgeMode = function(mode) {
-    // Remove the iFrame since it may be no longer required, and its existence
-    // can trigger browser bugs.
-    // https://issues.apache.org/jira/browse/CB-593
-    if (execIframe) {
-        execIframe.parentNode.removeChild(execIframe);
-        execIframe = null;
+function hookOnlineApis() {
+    function proxyEvent(e) {
+        cordova.fireWindowEvent(e.type);
     }
-    bridgeMode = mode;
-};
+    // The network module takes care of firing online and offline events.
+    // It currently fires them only on document though, so we bridge them
+    // to window here (while first listening for exec()-releated online/offline
+    // events).
+    window.addEventListener('online', pollOnce, false);
+    window.addEventListener('offline', pollOnce, false);
+    cordova.addWindowEventHandler('online');
+    cordova.addWindowEventHandler('offline');
+    document.addEventListener('online', proxyEvent, false);
+    document.addEventListener('offline', proxyEvent, false);
+}
 
-iOSExec.nativeFetchMessages = function() {
-    // Each entry in commandQueue is a JSON string already.
-    if (!commandQueue.length) {
-        return '';
+hookOnlineApis();
+
+androidExec.jsToNativeModes = jsToNativeModes;
+androidExec.nativeToJsModes = nativeToJsModes;
+
+androidExec.setJsToNativeBridgeMode = function(mode) {
+    if (mode == jsToNativeModes.JS_OBJECT && !window._cordovaNative) {
+        console.log('Falling back on PROMPT mode since _cordovaNative is missing.');
+        mode = jsToNativeModes.PROMPT;
     }
-    var json = '[' + commandQueue.join(',') + ']';
-    commandQueue.length = 0;
-    return json;
+    nativeApiProvider.setPreferPrompt(mode == jsToNativeModes.PROMPT);
+    jsToNativeBridgeMode = mode;
 };
 
-iOSExec.nativeCallback = function(callbackId, status, payload, keepCallback) {
-    return iOSExec.nativeEvalAndFetch(function() {
-        var success = status === 0 || status === 1;
-        payload = massagePayloadNativeToJs(payload);
-        cordova.callbackFromNative(callbackId, success, status, payload, keepCallback);
-    });
+androidExec.setNativeToJsBridgeMode = function(mode) {
+    if (mode == nativeToJsBridgeMode) {
+        return;
+    }
+    if (nativeToJsBridgeMode == nativeToJsModes.POLLING) {
+        pollEnabled = false;
+    }
+
+    nativeToJsBridgeMode = mode;
+    // Tell the native side to switch modes.
+    nativeApiProvider.get().setNativeToJsBridgeMode(mode);
+
+    if (mode == nativeToJsModes.POLLING) {
+        pollEnabled = true;
+        setTimeout(pollingTimerFunc, 1);
+    }
 };
 
-iOSExec.nativeEvalAndFetch = function(func) {
-    // This shouldn't be nested, but better to be safe.
-    isInContextOfEvalJs++;
+// Processes a single message, as encoded by NativeToJsMessageQueue.java.
+function processMessage(message) {
     try {
-        func();
-        return iOSExec.nativeFetchMessages();
-    } finally {
-        isInContextOfEvalJs--;
+        var firstChar = message.charAt(0);
+        if (firstChar == 'J') {
+            eval(message.slice(1));
+        } else if (firstChar == 'S' || firstChar == 'F') {
+            var success = firstChar == 'S';
+            var keepCallback = message.charAt(1) == '1';
+            var spaceIdx = message.indexOf(' ', 2);
+            var status = +message.slice(2, spaceIdx);
+            var nextSpaceIdx = message.indexOf(' ', spaceIdx + 1);
+            var callbackId = message.slice(spaceIdx + 1, nextSpaceIdx);
+            var payloadKind = message.charAt(nextSpaceIdx + 1);
+            var payload;
+            if (payloadKind == 's') {
+                payload = message.slice(nextSpaceIdx + 2);
+            } else if (payloadKind == 't') {
+                payload = true;
+            } else if (payloadKind == 'f') {
+                payload = false;
+            } else if (payloadKind == 'N') {
+                payload = null;
+            } else if (payloadKind == 'n') {
+                payload = +message.slice(nextSpaceIdx + 2);
+            } else if (payloadKind == 'A') {
+                var data = message.slice(nextSpaceIdx + 2);
+                var bytes = window.atob(data);
+                var arraybuffer = new Uint8Array(bytes.length);
+                for (var i = 0; i < bytes.length; i++) {
+                    arraybuffer[i] = bytes.charCodeAt(i);
+                }
+                payload = arraybuffer.buffer;
+            } else {
+                payload = JSON.parse(message.slice(nextSpaceIdx + 1));
+            }
+            cordova.callbackFromNative(callbackId, success, status, payload, keepCallback);
+        } else {
+            console.log("processMessage failed: invalid message:" + message);
+        }
+    } catch (e) {
+        console.log("processMessage failed: Message: " + message);
+        console.log("processMessage failed: Error: " + e);
+        console.log("processMessage failed: Stack: " + e.stack);
+    }
+}
+
+// This is called from the NativeToJsMessageQueue.java.
+androidExec.processMessages = function(messages) {
+    if (messages) {
+        messagesFromNative.push(messages);
+        while (messagesFromNative.length) {
+            messages = messagesFromNative.shift();
+            // The Java side can send a * message to indicate that it
+            // still has messages waiting to be retrieved.
+            // TODO(agrieve): This is currently disabled on the Java side
+            // since it breaks returning the result in exec of synchronous
+            // plugins. Once we remove this ability, we can remove this comment.
+            if (messages == '*') {
+                window.setTimeout(pollOnce, 0);
+                continue;
+            }
+
+            var spaceIdx = messages.indexOf(' ');
+            var msgLen = +messages.slice(0, spaceIdx);
+            var message = messages.substr(spaceIdx + 1, msgLen);
+            messages = messages.slice(spaceIdx + msgLen + 1);
+            // Put the remaining messages back into queue in case an exec()
+            // is made by the callback.
+            if (messages) {
+                messagesFromNative.unshift(messages);
+            }
+
+            if (message) {
+                processMessage(message);
+            }
+        }
     }
 };
 
-module.exports = iOSExec;
+module.exports = androidExec;
 
 });
 
@@ -1088,21 +1110,41 @@ exports.reset();
 
 });
 
-// file: lib/ios/platform.js
+// file: lib/android/platform.js
 define("cordova/platform", function(require, exports, module) {
 
 module.exports = {
-    id: "ios",
+    id: "android",
     initialize:function() {
-        var modulemapper = require('cordova/modulemapper');
-
-        modulemapper.loadMatchingModules(/cordova.*\/plugininit$/);
+        var channel = require("cordova/channel"),
+            cordova = require('cordova'),
+            exec = require('cordova/exec'),
+            modulemapper = require('cordova/modulemapper');
 
         modulemapper.loadMatchingModules(/cordova.*\/symbols$/);
+        modulemapper.clobbers('cordova/plugin/android/app', 'navigator.app');
+
         modulemapper.mapModules(window);
+
+        // Inject a listener for the backbutton on the document.
+        var backButtonChannel = cordova.addDocumentEventHandler('backbutton');
+        backButtonChannel.onHasSubscribersChange = function() {
+            // If we just attached the first handler or detached the last handler,
+            // let native know we need to override the back button.
+            exec(null, null, "App", "overrideBackbutton", [this.numHandlers == 1]);
+        };
+
+        // Add hardware MENU and SEARCH button handlers
+        cordova.addDocumentEventHandler('menubutton');
+        cordova.addDocumentEventHandler('searchbutton');
+
+        // Let native code know we are all done on the JS side.
+        // Native code will then un-hide the WebView.
+        channel.join(function() {
+            exec(null, null, "App", "show", []);
+        }, [channel.onCordovaReady]);
     }
 };
-
 
 });
 
@@ -1211,7 +1253,7 @@ module.exports = {
 
 });
 
-// file: lib/ios/plugin/CameraPopoverHandle.js
+// file: lib/common/plugin/CameraPopoverHandle.js
 define("cordova/plugin/CameraPopoverHandle", function(require, exports, module) {
 
 var exec = require('cordova/exec');
@@ -1221,8 +1263,7 @@ var exec = require('cordova/exec');
  */
 var CameraPopoverHandle = function() {
     this.setPosition = function(popoverOptions) {
-        var args = [ popoverOptions ];
-        exec(null, null, "Camera", "repositionPopover", args);
+        console.log('CameraPopoverHandle.setPosition is only supported on iOS.');
     };
 };
 
@@ -3720,6 +3761,563 @@ modulemapper.defaults('cordova/plugin/accelerometer', 'navigator.accelerometer')
 
 });
 
+// file: lib/android/plugin/android/app.js
+define("cordova/plugin/android/app", function(require, exports, module) {
+
+var exec = require('cordova/exec');
+
+module.exports = {
+  /**
+   * Clear the resource cache.
+   */
+  clearCache:function() {
+    exec(null, null, "App", "clearCache", []);
+  },
+
+  /**
+   * Load the url into the webview or into new browser instance.
+   *
+   * @param url           The URL to load
+   * @param props         Properties that can be passed in to the activity:
+   *      wait: int                           => wait msec before loading URL
+   *      loadingDialog: "Title,Message"      => display a native loading dialog
+   *      loadUrlTimeoutValue: int            => time in msec to wait before triggering a timeout error
+   *      clearHistory: boolean              => clear webview history (default=false)
+   *      openExternal: boolean              => open in a new browser (default=false)
+   *
+   * Example:
+   *      navigator.app.loadUrl("http://server/myapp/index.html", {wait:2000, loadingDialog:"Wait,Loading App", loadUrlTimeoutValue: 60000});
+   */
+  loadUrl:function(url, props) {
+    exec(null, null, "App", "loadUrl", [url, props]);
+  },
+
+  /**
+   * Cancel loadUrl that is waiting to be loaded.
+   */
+  cancelLoadUrl:function() {
+    exec(null, null, "App", "cancelLoadUrl", []);
+  },
+
+  /**
+   * Clear web history in this web view.
+   * Instead of BACK button loading the previous web page, it will exit the app.
+   */
+  clearHistory:function() {
+    exec(null, null, "App", "clearHistory", []);
+  },
+
+  /**
+   * Go to previous page displayed.
+   * This is the same as pressing the backbutton on Android device.
+   */
+  backHistory:function() {
+    exec(null, null, "App", "backHistory", []);
+  },
+
+  /**
+   * Override the default behavior of the Android back button.
+   * If overridden, when the back button is pressed, the "backKeyDown" JavaScript event will be fired.
+   *
+   * Note: The user should not have to call this method.  Instead, when the user
+   *       registers for the "backbutton" event, this is automatically done.
+   *
+   * @param override        T=override, F=cancel override
+   */
+  overrideBackbutton:function(override) {
+    exec(null, null, "App", "overrideBackbutton", [override]);
+  },
+
+  /**
+   * Exit and terminate the application.
+   */
+  exitApp:function() {
+    return exec(null, null, "App", "exitApp", []);
+  }
+};
+
+});
+
+// file: lib/android/plugin/android/device.js
+define("cordova/plugin/android/device", function(require, exports, module) {
+
+var channel = require('cordova/channel'),
+    utils = require('cordova/utils'),
+    exec = require('cordova/exec'),
+    app = require('cordova/plugin/android/app');
+
+module.exports = {
+    /*
+     * DEPRECATED
+     * This is only for Android.
+     *
+     * You must explicitly override the back button.
+     */
+    overrideBackButton:function() {
+        console.log("Device.overrideBackButton() is deprecated.  Use App.overrideBackbutton(true).");
+        app.overrideBackbutton(true);
+    },
+
+    /*
+     * DEPRECATED
+     * This is only for Android.
+     *
+     * This resets the back button to the default behavior
+     */
+    resetBackButton:function() {
+        console.log("Device.resetBackButton() is deprecated.  Use App.overrideBackbutton(false).");
+        app.overrideBackbutton(false);
+    },
+
+    /*
+     * DEPRECATED
+     * This is only for Android.
+     *
+     * This terminates the activity!
+     */
+    exitApp:function() {
+        console.log("Device.exitApp() is deprecated.  Use App.exitApp().");
+        app.exitApp();
+    }
+};
+
+});
+
+// file: lib/android/plugin/android/nativeapiprovider.js
+define("cordova/plugin/android/nativeapiprovider", function(require, exports, module) {
+
+var nativeApi = this._cordovaNative || require('cordova/plugin/android/promptbasednativeapi');
+var currentApi = nativeApi;
+
+module.exports = {
+    get: function() { return currentApi; },
+    setPreferPrompt: function(value) {
+        currentApi = value ? require('cordova/plugin/android/promptbasednativeapi') : nativeApi;
+    },
+    // Used only by tests.
+    set: function(value) {
+        currentApi = value;
+    }
+};
+
+});
+
+// file: lib/android/plugin/android/notification.js
+define("cordova/plugin/android/notification", function(require, exports, module) {
+
+var exec = require('cordova/exec');
+
+/**
+ * Provides Android enhanced notification API.
+ */
+module.exports = {
+    activityStart : function(title, message) {
+        // If title and message not specified then mimic Android behavior of
+        // using default strings.
+        if (typeof title === "undefined" && typeof message == "undefined") {
+            title = "Busy";
+            message = 'Please wait...';
+        }
+
+        exec(null, null, 'Notification', 'activityStart', [ title, message ]);
+    },
+
+    /**
+     * Close an activity dialog
+     */
+    activityStop : function() {
+        exec(null, null, 'Notification', 'activityStop', []);
+    },
+
+    /**
+     * Display a progress dialog with progress bar that goes from 0 to 100.
+     *
+     * @param {String}
+     *            title Title of the progress dialog.
+     * @param {String}
+     *            message Message to display in the dialog.
+     */
+    progressStart : function(title, message) {
+        exec(null, null, 'Notification', 'progressStart', [ title, message ]);
+    },
+
+    /**
+     * Close the progress dialog.
+     */
+    progressStop : function() {
+        exec(null, null, 'Notification', 'progressStop', []);
+    },
+
+    /**
+     * Set the progress dialog value.
+     *
+     * @param {Number}
+     *            value 0-100
+     */
+    progressValue : function(value) {
+        exec(null, null, 'Notification', 'progressValue', [ value ]);
+    }
+};
+
+});
+
+// file: lib/android/plugin/android/promptbasednativeapi.js
+define("cordova/plugin/android/promptbasednativeapi", function(require, exports, module) {
+
+module.exports = {
+    exec: function(service, action, callbackId, argsJson) {
+        return prompt(argsJson, 'gap:'+JSON.stringify([service, action, callbackId]));
+    },
+    setNativeToJsBridgeMode: function(value) {
+        prompt(value, 'gap_bridge_mode:');
+    },
+    retrieveJsMessages: function() {
+        return prompt('', 'gap_poll:');
+    }
+};
+
+});
+
+// file: lib/android/plugin/android/storage.js
+define("cordova/plugin/android/storage", function(require, exports, module) {
+
+var utils = require('cordova/utils'),
+    exec = require('cordova/exec'),
+    channel = require('cordova/channel');
+
+var queryQueue = {};
+
+/**
+ * SQL result set object
+ * PRIVATE METHOD
+ * @constructor
+ */
+var DroidDB_Rows = function() {
+    this.resultSet = [];    // results array
+    this.length = 0;        // number of rows
+};
+
+/**
+ * Get item from SQL result set
+ *
+ * @param row           The row number to return
+ * @return              The row object
+ */
+DroidDB_Rows.prototype.item = function(row) {
+    return this.resultSet[row];
+};
+
+/**
+ * SQL result set that is returned to user.
+ * PRIVATE METHOD
+ * @constructor
+ */
+var DroidDB_Result = function() {
+    this.rows = new DroidDB_Rows();
+};
+
+/**
+ * Callback from native code when query is complete.
+ * PRIVATE METHOD
+ *
+ * @param id   Query id
+ */
+function completeQuery(id, data) {
+    var query = queryQueue[id];
+    if (query) {
+        try {
+            delete queryQueue[id];
+
+            // Get transaction
+            var tx = query.tx;
+
+            // If transaction hasn't failed
+            // Note: We ignore all query results if previous query
+            //       in the same transaction failed.
+            if (tx && tx.queryList[id]) {
+
+                // Save query results
+                var r = new DroidDB_Result();
+                r.rows.resultSet = data;
+                r.rows.length = data.length;
+                try {
+                    if (typeof query.successCallback === 'function') {
+                        query.successCallback(query.tx, r);
+                    }
+                } catch (ex) {
+                    console.log("executeSql error calling user success callback: "+ex);
+                }
+
+                tx.queryComplete(id);
+            }
+        } catch (e) {
+            console.log("executeSql error: "+e);
+        }
+    }
+}
+
+/**
+ * Callback from native code when query fails
+ * PRIVATE METHOD
+ *
+ * @param reason            Error message
+ * @param id                Query id
+ */
+function failQuery(reason, id) {
+    var query = queryQueue[id];
+    if (query) {
+        try {
+            delete queryQueue[id];
+
+            // Get transaction
+            var tx = query.tx;
+
+            // If transaction hasn't failed
+            // Note: We ignore all query results if previous query
+            //       in the same transaction failed.
+            if (tx && tx.queryList[id]) {
+                tx.queryList = {};
+
+                try {
+                    if (typeof query.errorCallback === 'function') {
+                        query.errorCallback(query.tx, reason);
+                    }
+                } catch (ex) {
+                    console.log("executeSql error calling user error callback: "+ex);
+                }
+
+                tx.queryFailed(id, reason);
+            }
+
+        } catch (e) {
+            console.log("executeSql error: "+e);
+        }
+    }
+}
+
+/**
+ * SQL query object
+ * PRIVATE METHOD
+ *
+ * @constructor
+ * @param tx                The transaction object that this query belongs to
+ */
+var DroidDB_Query = function(tx) {
+
+    // Set the id of the query
+    this.id = utils.createUUID();
+
+    // Add this query to the queue
+    queryQueue[this.id] = this;
+
+    // Init result
+    this.resultSet = [];
+
+    // Set transaction that this query belongs to
+    this.tx = tx;
+
+    // Add this query to transaction list
+    this.tx.queryList[this.id] = this;
+
+    // Callbacks
+    this.successCallback = null;
+    this.errorCallback = null;
+
+};
+
+/**
+ * Transaction object
+ * PRIVATE METHOD
+ * @constructor
+ */
+var DroidDB_Tx = function() {
+
+    // Set the id of the transaction
+    this.id = utils.createUUID();
+
+    // Callbacks
+    this.successCallback = null;
+    this.errorCallback = null;
+
+    // Query list
+    this.queryList = {};
+};
+
+/**
+ * Mark query in transaction as complete.
+ * If all queries are complete, call the user's transaction success callback.
+ *
+ * @param id                Query id
+ */
+DroidDB_Tx.prototype.queryComplete = function(id) {
+    delete this.queryList[id];
+
+    // If no more outstanding queries, then fire transaction success
+    if (this.successCallback) {
+        var count = 0;
+        var i;
+        for (i in this.queryList) {
+            if (this.queryList.hasOwnProperty(i)) {
+                count++;
+            }
+        }
+        if (count === 0) {
+            try {
+                this.successCallback();
+            } catch(e) {
+                console.log("Transaction error calling user success callback: " + e);
+            }
+        }
+    }
+};
+
+/**
+ * Mark query in transaction as failed.
+ *
+ * @param id                Query id
+ * @param reason            Error message
+ */
+DroidDB_Tx.prototype.queryFailed = function(id, reason) {
+
+    // The sql queries in this transaction have already been run, since
+    // we really don't have a real transaction implemented in native code.
+    // However, the user callbacks for the remaining sql queries in transaction
+    // will not be called.
+    this.queryList = {};
+
+    if (this.errorCallback) {
+        try {
+            this.errorCallback(reason);
+        } catch(e) {
+            console.log("Transaction error calling user error callback: " + e);
+        }
+    }
+};
+
+/**
+ * Execute SQL statement
+ *
+ * @param sql                   SQL statement to execute
+ * @param params                Statement parameters
+ * @param successCallback       Success callback
+ * @param errorCallback         Error callback
+ */
+DroidDB_Tx.prototype.executeSql = function(sql, params, successCallback, errorCallback) {
+
+    // Init params array
+    if (typeof params === 'undefined') {
+        params = [];
+    }
+
+    // Create query and add to queue
+    var query = new DroidDB_Query(this);
+    queryQueue[query.id] = query;
+
+    // Save callbacks
+    query.successCallback = successCallback;
+    query.errorCallback = errorCallback;
+
+    // Call native code
+    exec(null, null, "Storage", "executeSql", [sql, params, query.id]);
+};
+
+var DatabaseShell = function() {
+};
+
+/**
+ * Start a transaction.
+ * Does not support rollback in event of failure.
+ *
+ * @param process {Function}            The transaction function
+ * @param successCallback {Function}
+ * @param errorCallback {Function}
+ */
+DatabaseShell.prototype.transaction = function(process, errorCallback, successCallback) {
+    var tx = new DroidDB_Tx();
+    tx.successCallback = successCallback;
+    tx.errorCallback = errorCallback;
+    try {
+        process(tx);
+    } catch (e) {
+        console.log("Transaction error: "+e);
+        if (tx.errorCallback) {
+            try {
+                tx.errorCallback(e);
+            } catch (ex) {
+                console.log("Transaction error calling user error callback: "+e);
+            }
+        }
+    }
+};
+
+/**
+ * Open database
+ *
+ * @param name              Database name
+ * @param version           Database version
+ * @param display_name      Database display name
+ * @param size              Database size in bytes
+ * @return                  Database object
+ */
+var DroidDB_openDatabase = function(name, version, display_name, size) {
+    exec(null, null, "Storage", "openDatabase", [name, version, display_name, size]);
+    var db = new DatabaseShell();
+    return db;
+};
+
+
+module.exports = {
+  openDatabase:DroidDB_openDatabase,
+  failQuery:failQuery,
+  completeQuery:completeQuery
+};
+
+});
+
+// file: lib/android/plugin/android/storage/openDatabase.js
+define("cordova/plugin/android/storage/openDatabase", function(require, exports, module) {
+
+
+var modulemapper = require('cordova/modulemapper'),
+    storage = require('cordova/plugin/android/storage');
+
+var originalOpenDatabase = modulemapper.getOriginalSymbol(window, 'openDatabase');
+
+module.exports = function(name, version, desc, size) {
+    // First patch WebSQL if necessary
+    if (!originalOpenDatabase) {
+        // Not defined, create an openDatabase function for all to use!
+        return storage.openDatabase.apply(this, arguments);
+    }
+
+    // Defined, but some Android devices will throw a SECURITY_ERR -
+    // so we wrap the whole thing in a try-catch and shim in our own
+    // if the device has Android bug 16175.
+    try {
+        return originalOpenDatabase(name, version, desc, size);
+    } catch (ex) {
+        if (ex.code !== 18) {
+            throw ex;
+        }
+    }
+    return storage.openDatabase(name, version, desc, size);
+};
+
+
+
+});
+
+// file: lib/android/plugin/android/storage/symbols.js
+define("cordova/plugin/android/storage/symbols", function(require, exports, module) {
+
+
+var modulemapper = require('cordova/modulemapper');
+
+modulemapper.clobbers('cordova/plugin/android/storage/openDatabase', 'openDatabase');
+
+
+});
+
 // file: lib/common/plugin/battery.js
 define("cordova/plugin/battery", function(require, exports, module) {
 
@@ -4328,13 +4926,14 @@ module.exports = new Device();
 
 });
 
-// file: lib/common/plugin/device/symbols.js
+// file: lib/android/plugin/device/symbols.js
 define("cordova/plugin/device/symbols", function(require, exports, module) {
 
 
 var modulemapper = require('cordova/modulemapper');
 
 modulemapper.clobbers('cordova/plugin/device', 'device');
+modulemapper.merges('cordova/plugin/android/device', 'device');
 
 });
 
@@ -4361,7 +4960,7 @@ module.exports = function(successCallback, errorCallback, message, forceAsync) {
 
 });
 
-// file: lib/ios/plugin/file/symbols.js
+// file: lib/android/plugin/file/symbols.js
 define("cordova/plugin/file/symbols", function(require, exports, module) {
 
 
@@ -4369,7 +4968,6 @@ var modulemapper = require('cordova/modulemapper'),
     symbolshelper = require('cordova/plugin/file/symbolshelper');
 
 symbolshelper(modulemapper.clobbers);
-modulemapper.merges('cordova/plugin/ios/Entry', 'Entry');
 
 });
 
@@ -5005,233 +5603,13 @@ modulemapper.clobbers('cordova/plugin/GlobalizationError', 'GlobalizationError')
 
 });
 
-// file: lib/ios/plugin/inappbrowser/symbols.js
+// file: lib/android/plugin/inappbrowser/symbols.js
 define("cordova/plugin/inappbrowser/symbols", function(require, exports, module) {
 
 
 var modulemapper = require('cordova/modulemapper');
 
 modulemapper.clobbers('cordova/plugin/InAppBrowser', 'open');
-
-});
-
-// file: lib/ios/plugin/ios/Contact.js
-define("cordova/plugin/ios/Contact", function(require, exports, module) {
-
-var exec = require('cordova/exec'),
-    ContactError = require('cordova/plugin/ContactError');
-
-/**
- * Provides iOS Contact.display API.
- */
-module.exports = {
-    display : function(errorCB, options) {
-        /*
-         *    Display a contact using the iOS Contact Picker UI
-         *    NOT part of W3C spec so no official documentation
-         *
-         *    @param errorCB error callback
-         *    @param options object
-         *    allowsEditing: boolean AS STRING
-         *        "true" to allow editing the contact
-         *        "false" (default) display contact
-         */
-
-        if (this.id === null) {
-            if (typeof errorCB === "function") {
-                var errorObj = new ContactError(ContactError.UNKNOWN_ERROR);
-                errorCB(errorObj);
-            }
-        }
-        else {
-            exec(null, errorCB, "Contacts","displayContact", [this.id, options]);
-        }
-    }
-};
-
-});
-
-// file: lib/ios/plugin/ios/Entry.js
-define("cordova/plugin/ios/Entry", function(require, exports, module) {
-
-module.exports = {
-    toURL:function() {
-        // TODO: refactor path in a cross-platform way so we can eliminate
-        // these kinds of platform-specific hacks.
-        return "file://localhost" + this.fullPath;
-    },
-    toURI: function() {
-        console.log("DEPRECATED: Update your code to use 'toURL'");
-        return "file://localhost" + this.fullPath;
-    }
-};
-
-});
-
-// file: lib/ios/plugin/ios/console.js
-define("cordova/plugin/ios/console", function(require, exports, module) {
-
-var exec = require('cordova/exec');
-
-/**
- * create a nice string for an object
- */
-function stringify(message) {
-    try {
-        if (typeof message === "object" && JSON && JSON.stringify) {
-            try {
-                return JSON.stringify(message);
-            }
-            catch (e) {
-                return "error JSON.stringify()ing argument: " + e;
-            }
-        } else {
-            return message.toString();
-        }
-    } catch (e) {
-        return e.toString();
-    }
-}
-
-/**
- * Wrapper one of the console logging methods, so that
- * the Cordova logging native is called, then the original.
- */
-function wrappedMethod(console, method) {
-    var origMethod = console[method];
-
-    return function(message) {
-        exec(null, null,
-            'Debug Console', 'log',
-            [ stringify(message), { logLevel: method.toUpperCase() } ]
-        );
-
-        if (!origMethod) return;
-
-        origMethod.apply(console, arguments);
-    };
-}
-
-var console = window.console || {};
-
-// 2012-10-06 pmuellr - marking setLevel() method and logLevel property
-// on console as deprecated;
-// it didn't do anything useful, since the level constants weren't accessible
-// to anyone
-
-console.setLevel = function() {};
-console.logLevel = 0;
-
-// wrapper the logging messages
-
-var methods = ["log", "debug", "info", "warn", "error"];
-
-for (var i=0; i<methods.length; i++) {
-    var method = methods[i];
-
-    console[method] = wrappedMethod(console, method);
-}
-
-module.exports = console;
-
-});
-
-// file: lib/ios/plugin/ios/console/symbols.js
-define("cordova/plugin/ios/console/symbols", function(require, exports, module) {
-
-var modulemapper = require('cordova/modulemapper');
-
-modulemapper.clobbers('cordova/plugin/ios/console', 'console');
-
-});
-
-// file: lib/ios/plugin/ios/contacts.js
-define("cordova/plugin/ios/contacts", function(require, exports, module) {
-
-var exec = require('cordova/exec');
-
-/**
- * Provides iOS enhanced contacts API.
- */
-module.exports = {
-    newContactUI : function(successCallback) {
-        /*
-         *    Create a contact using the iOS Contact Picker UI
-         *    NOT part of W3C spec so no official documentation
-         *
-         * returns:  the id of the created contact as param to successCallback
-         */
-        exec(successCallback, null, "Contacts","newContact", []);
-    },
-    chooseContact : function(successCallback, options) {
-        /*
-         *    Select a contact using the iOS Contact Picker UI
-         *    NOT part of W3C spec so no official documentation
-         *
-         *    @param errorCB error callback
-         *    @param options object
-         *    allowsEditing: boolean AS STRING
-         *        "true" to allow editing the contact
-         *        "false" (default) display contact
-         *      fields: array of fields to return in contact object (see ContactOptions.fields)
-         *
-         *    @returns
-         *        id of contact selected
-         *        ContactObject
-         *            if no fields provided contact contains just id information
-         *            if fields provided contact object contains information for the specified fields
-         *
-         */
-         var win = function(result) {
-             var fullContact = require('cordova/plugin/contacts').create(result);
-            successCallback(fullContact.id, fullContact);
-       };
-        exec(win, null, "Contacts","chooseContact", [options]);
-    }
-};
-
-});
-
-// file: lib/ios/plugin/ios/contacts/symbols.js
-define("cordova/plugin/ios/contacts/symbols", function(require, exports, module) {
-
-require('cordova/plugin/contacts/symbols');
-
-var modulemapper = require('cordova/modulemapper');
-
-modulemapper.merges('cordova/plugin/ios/contacts', 'navigator.contacts');
-modulemapper.merges('cordova/plugin/ios/Contact', 'Contact');
-
-});
-
-// file: lib/ios/plugin/ios/geolocation/symbols.js
-define("cordova/plugin/ios/geolocation/symbols", function(require, exports, module) {
-
-var modulemapper = require('cordova/modulemapper');
-
-modulemapper.merges('cordova/plugin/geolocation', 'navigator.geolocation');
-
-});
-
-// file: lib/ios/plugin/ios/logger/plugininit.js
-define("cordova/plugin/ios/logger/plugininit", function(require, exports, module) {
-
-// use the native logger
-var logger = require("cordova/plugin/logger");
-logger.useConsole(false);
-
-});
-
-// file: lib/ios/plugin/ios/notification.js
-define("cordova/plugin/ios/notification", function(require, exports, module) {
-
-var Media = require('cordova/plugin/Media');
-
-module.exports = {
-    beep:function(count) {
-        (new Media('beep.wav')).play();
-    }
-};
 
 });
 
@@ -5473,7 +5851,7 @@ modulemapper.clobbers('cordova/plugin/logger', 'cordova.logger');
 
 });
 
-// file: lib/ios/plugin/media/symbols.js
+// file: lib/android/plugin/media/symbols.js
 define("cordova/plugin/media/symbols", function(require, exports, module) {
 
 
@@ -5630,14 +6008,14 @@ module.exports = {
 
 });
 
-// file: lib/ios/plugin/notification/symbols.js
+// file: lib/android/plugin/notification/symbols.js
 define("cordova/plugin/notification/symbols", function(require, exports, module) {
 
 
 var modulemapper = require('cordova/modulemapper');
 
 modulemapper.clobbers('cordova/plugin/notification', 'navigator.notification');
-modulemapper.merges('cordova/plugin/ios/notification', 'navigator.notification');
+modulemapper.merges('cordova/plugin/android/notification', 'navigator.notification');
 
 });
 
@@ -6080,4 +6458,4 @@ window.cordova = require('cordova');
 }(window));
 
 
-})();
+})();var PhoneGap = cordova;

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>window.open Example</title>
+
+    <script type="text/javascript" charset="utf-8" src="cordova-2.5.0.js"></script>
+    <script type="text/javascript" charset="utf-8">
+
+    // Wait for Cordova to load
+    //
+    document.addEventListener("deviceready", onDeviceReady, false);
+
+    // Cordova is ready
+    //
+    function onDeviceReady() {
+        /* external url */
+        // var ref = window.open(encodeURI('http://apache.org'), '_blank', 'location=yes');
+        // relative document */
+        
+    }
+    function sigPage(){
+      var ref=window.open("enlaces.html","_self");
+    }
+
+    </script>
+    <style>
+      div{
+        border:1px solid #ABC;
+        padding: 3px;
+        border-radius: 5px;
+        color: #112345;
+        background-color: #A0A;
+      }
+    </style>
+  </head>
+  <body>
+    <div onclick="sigPage();return false;">Ir a Siguiente Pagina</div>
+  </body>
+</html>

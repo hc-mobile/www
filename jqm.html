@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Example with JqueryMobile</title>
+
+    <script type="text/javascript" charset="utf-8" src="cordova-2.5.0.js"></script>
+    <link rel="stylesheet" href="http://code.jquery.com/mobile/1.3.0/jquery.mobile-1.3.0.min.css" />
+    <script src="http://code.jquery.com/jquery-1.8.2.min.js"></script>
+    <script src="http://code.jquery.com/mobile/1.3.0/jquery.mobile-1.3.0.min.js"></script>
+  </head>
+  <body>
+    <div data-role="page" id="first">
+      <div data-role="header">
+        <h1>Countries</h1>
+      </div>
+      <div data-role="content">
+        <ul data-role="listview" data-theme="a" data-inset="true" data-filter="true" data-inset="true">
+          <li><a href="#second" data-transition="flip" data-inline="true"><img src="img/flag/ar-t.gif" alt="France" class="ui-li-icon ui-corner-none">France</a></li>
+          <li><a href="#second" data-transition="pop" data-inline="true"><img src="img/flag/br-t.gif" alt="Germany" class="ui-li-icon">Germany</a></li>
+          <li><a href="#second" data-transition="slide" data-inline="true"><img src="img/flag/ch-t.gif" alt="Great Britain" class="ui-li-icon">Great Britain</a></li>
+          <li><a href="#second" data-transition="turn" data-inline="true"><img src="img/flag/co-t.gif" alt="Finland" class="ui-li-icon">Finland</a></li>
+          <li><a href="#second" data-transition="fade" data-inline="true"><img src="img/flag/de-t.gif" alt="United States" class="ui-li-icon ui-corner-none">United States</a></li>
+        </ul>
+      </div>
+      <div data-role="footer" data-position="fixed">
+        <h4>2013</h4>
+      </div>
+    </div>
+
+    <div data-role="page" id="second">
+      <div data-role="header">
+        <h1>Countries</h1>
+      </div>
+      <div data-role="content">
+        <ul data-role="listview" data-theme="a" data-inset="true" data-filter="true" data-inset="true">
+            <li><a href="#first" data-transition="flip" data-inline="true"><img src="img/flag/ec-t.gif" alt="France" class="ui-li-icon ui-corner-none">Ecuador</a></li>
+            <li><a href="#first" data-transition="pop" data-inline="true"><img src="img/flag/in-t.gif" alt="Germany" class="ui-li-icon">Alemania</a></li>
+            <li><a href="#first" data-transition="slide" data-inline="true"><img src="img/flag/it-t.gif" alt="Great Britain" class="ui-li-icon">Italia</a></li>
+            <li><a href="#first" data-transition="turn" data-inline="true"><img src="img/flag/ja-t.gif" alt="Finland" class="ui-li-icon">Japon</a></li>
+        </ul>
+      </div>
+      <div data-role="footer" data-position="fixed">
+        <h4>2013</h4>
+      </div>
+    </div>
+
+</ul>
+  </body>
+</html>
