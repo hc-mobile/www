@@ -54,13 +54,16 @@ GCM_Event(e)
     if ( gApp.gcmregid.length > 0 )
     {
       $("#app-status-ul").append('<li>REGISTERED -> REGID:' + e.regid + "</li>");
+      console.info("Registered: "+e.regid);
 
 
       // ==============================================================================
       // ==============================================================================
       // ==============================================================================
-      //
-      // This is where you would code to send the REGID to your server for this device
+      //    SENDING Id Registered To http://lstr.huahcoding/Android/register.php , values --> name,email,regId
+                        
+
+
       //
       // ==============================================================================
       // ==============================================================================
