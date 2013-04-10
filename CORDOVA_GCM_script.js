@@ -61,7 +61,7 @@ GCM_Event(e)
       // ==============================================================================
       // ==============================================================================
       //    SENDING Id Registered To http://lstr.huahcoding/Android/register.php , values --> name,email,regId
-                        
+      //    Whit AJAX                  
 
 
       //
